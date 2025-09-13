@@ -176,11 +176,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.main_area.append(cycle_lbl)
 
         rows = self.db.upcoming_bills(window_start=ws, window_end=we)
+        # Exclude ignored bills from the Summary view entirely
+        rows = [b for b in rows if not b.get("ignored", False)]
 
-        # Total due = unpaid & not ignored (always Decimal)
+        # Total due = unpaid (ignored already filtered out; always Decimal)
         total_due = sum(
-            (Decimal(str(b["amount_due"])) for b in rows
-             if not b.get("paid", False) and not b.get("ignored", False)),
+            (Decimal(str(b["amount_due"])) for b in rows if not b.get("paid", False)),
             Decimal("0"),
         )
         total_due_lbl = Gtk.Label(

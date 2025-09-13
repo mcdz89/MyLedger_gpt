@@ -311,8 +311,12 @@ class Database:
 
     def get_pay_window(self, today: date | None = None) -> tuple[date, date]:
         """
-        Return (window_start, window_end) for the NEXT payday (>= today) and the
-        2-week window that follows (14-day cycle).
+        Return (window_start, window_end) for the 14-day pay window that CONTAINS
+        "today" (inclusive), based on the known bi-weekly anchor payday.
+
+        - Includes the actual payday (window_start = payday)
+        - Always 14 days long: [start, start+13]
+        - If payday slips, this still returns the prior window covering today.
         """
         today = today or date.today()
         with self.pool.connection() as conn, conn.cursor() as cur:
@@ -321,15 +325,13 @@ class Database:
             anchor = row[0] if row else today
 
         step = 14
-        if anchor >= today:
-            next_pd = anchor
-        else:
-            days = (today - anchor).days
-            k = (days + step - 1) // step
-            next_pd = anchor + timedelta(days=step * k)
-            if next_pd < today:
-                next_pd += timedelta(days=step)
-        return next_pd, next_pd + timedelta(days=13)
+        # Compute the payday at or before today
+        days = (today - anchor).days
+        k = days // step  # floor division works for negatives too
+        start = anchor + timedelta(days=step * k)
+        end = start + timedelta(days=13)
+        # If today somehow falls before the very first anchor (k<0), start is previous cycle
+        return start, end
 
     # ========= BILLS (bills, bill_payments) =========
 
