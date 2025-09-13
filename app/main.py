@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 import os
 from dotenv import load_dotenv
@@ -17,7 +19,7 @@ if not DATABASE_URL:
     raise SystemExit("DATABASE_URL not set. Add it to .env")
 
 def main():
-    app = Adw.Application(application_id="com.example.fintrack.py")
+    app = Adw.Application(application_id="com.example.myledger.py")
     db = Database(DATABASE_URL)
     def on_activate(app: Adw.Application):
         win = MainWindow(app, db); win.present()

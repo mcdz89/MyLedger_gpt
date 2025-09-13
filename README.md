@@ -1,2 +1,5 @@
 # MyLedger_gpt
-An AI gerneated Python 3.11 app for finance tracking and management.
+
+Notice: This application was generated in part with the help of an AI LLM.
+
+MyLedger is a personal finance desktop app for Ubuntu (Python 3.11 + GTK4/libadwaita + PostgreSQL) focused on privacy and simplicity.
