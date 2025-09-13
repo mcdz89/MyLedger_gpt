@@ -499,10 +499,10 @@ class MainWindow(Adw.ApplicationWindow):
             about = AboutWin(
                 application_name="MyLedger",
                 version="0.1.0",
-                developer_name="Your Name",
+                developer_name="James McDermott",
                 comments="This application was generated in part with the help of an AI LLM.",
                 license_type=license_type,
-                website="https://github.com/yourname/myledger",
+                website="https://github.com/mcdz89/MyLedger_gpt",
             )
             about.set_transient_for(self)
             about.present()
@@ -513,9 +513,9 @@ class MainWindow(Adw.ApplicationWindow):
             program_name="MyLedger",
             version="0.1.0",
             comments="This application was generated in part with the help of an AI LLM.",
-            website="https://github.com/yourname/myledger",
+            website="https://github.com/mcdz89/MyLedger_gpt",
             license_type=Gtk.License.APACHE_2_0,
-            authors=["Your Name"],
+            authors=["James McDermott"],
         )
         about.set_transient_for(self)
         about.present()
