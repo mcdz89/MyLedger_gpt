@@ -488,14 +488,34 @@ class MainWindow(Adw.ApplicationWindow):
         ).show()
 
     def _show_about(self, *_):
-        # Minimal About window with AI notice; adjust fields as you like
-        about = Adw.AboutWindow(
-            application_name="MyLedger",
+        # Prefer Adw.AboutWindow when available; fallback to Gtk.AboutDialog for older libadwaita
+        AboutWin = getattr(Adw, "AboutWindow", None)
+        if AboutWin is not None:
+            LicenseEnum = getattr(Adw, "License", None)
+            license_type = getattr(LicenseEnum, "APACHE_2_0", None)
+            if license_type is None:
+                # Fallback to Gtk license enum if Adw.License is missing
+                license_type = Gtk.License.APACHE_2_0
+            about = AboutWin(
+                application_name="MyLedger",
+                version="0.1.0",
+                developer_name="Your Name",
+                comments="This application was generated in part with the help of an AI LLM.",
+                license_type=license_type,
+                website="https://github.com/yourname/myledger",
+            )
+            about.set_transient_for(self)
+            about.present()
+            return
+
+        # GTK fallback
+        about = Gtk.AboutDialog(
+            program_name="MyLedger",
             version="0.1.0",
-            developer_name="Your Name",
             comments="This application was generated in part with the help of an AI LLM.",
-            license_type=Adw.License.APACHE_2_0,  # change if you chose MIT
             website="https://github.com/yourname/myledger",
+            license_type=Gtk.License.APACHE_2_0,
+            authors=["Your Name"],
         )
         about.set_transient_for(self)
         about.present()
