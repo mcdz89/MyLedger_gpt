@@ -176,11 +176,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.main_area.append(cycle_lbl)
 
         rows = self.db.upcoming_bills(window_start=ws, window_end=we)
+        # Exclude ignored bills from the Summary view entirely
+        rows = [b for b in rows if not b.get("ignored", False)]
 
-        # Total due = unpaid & not ignored (always Decimal)
+        # Total due = unpaid (ignored already filtered out; always Decimal)
         total_due = sum(
-            (Decimal(str(b["amount_due"])) for b in rows
-             if not b.get("paid", False) and not b.get("ignored", False)),
+            (Decimal(str(b["amount_due"])) for b in rows if not b.get("paid", False)),
             Decimal("0"),
         )
         total_due_lbl = Gtk.Label(
@@ -265,30 +266,13 @@ class MainWindow(Adw.ApplicationWindow):
         def load():
             self.clear_box(list_box)
 
-            # ALL active bills with computed next due (relative to today)
-            base = _date.today()
-            bills = self.db.list_bills(active_only=True)
-
-            rows = []
-            for b in bills:
-                freq = (b["frequency"] or "monthly").lower()
-                if freq == "monthly" and b["due_day"]:
-                    due = _next_monthly_due(int(b["due_day"]), base)
-                elif freq == "yearly" and b["due_month"] and b["due_dom"]:
-                    due = _next_yearly_due(int(b["due_month"]), int(b["due_dom"]), base)
-                else:
-                    continue
-
-                b2 = dict(b)
-                b2["next_due"] = due
-                b2["paid"] = self.db._is_bill_paid(bill_id=int(b["id"]), due_date=due)
-                b2["ignored"] = self.db._is_bill_ignored(bill_id=int(b["id"]), due_date=due)
-                rows.append(b2)
-
-            rows.sort(key=lambda r: (r["next_due"], r["payee"].lower()))
+            # Show bills for the CURRENT pay window only, so ignore/paid toggles
+            # operate on the same occurrence shown in Summary.
+            ws, we = self.db.get_pay_window()
+            rows = self.db.upcoming_bills(window_start=ws, window_end=we)
 
             if not rows:
-                list_box.append(Gtk.Label(label="No active bills.", xalign=0))
+                list_box.append(Gtk.Label(label="No bills in this pay window.", xalign=0))
                 return
 
             for b in rows:
@@ -499,10 +483,10 @@ class MainWindow(Adw.ApplicationWindow):
             about = AboutWin(
                 application_name="MyLedger",
                 version="0.1.0",
-                developer_name="Your Name",
+                developer_name="James McDermott",
                 comments="This application was generated in part with the help of an AI LLM.",
                 license_type=license_type,
-                website="https://github.com/yourname/myledger",
+                website="https://github.com/mcdz89/MyLedger_gpt",
             )
             about.set_transient_for(self)
             about.present()
@@ -513,9 +497,9 @@ class MainWindow(Adw.ApplicationWindow):
             program_name="MyLedger",
             version="0.1.0",
             comments="This application was generated in part with the help of an AI LLM.",
-            website="https://github.com/yourname/myledger",
+            website="https://github.com/mcdz89/MyLedger_gpt",
             license_type=Gtk.License.APACHE_2_0,
-            authors=["Your Name"],
+            authors=["James McDermott"],
         )
         about.set_transient_for(self)
         about.present()
