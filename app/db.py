@@ -249,6 +249,11 @@ class Database:
         with self.pool.connection() as conn, conn.cursor() as cur:
             cur.execute("UPDATE transactions SET pending=%s WHERE id=%s", (1 if pending else 0, txn_id))
 
+    def delete_transaction(self, txn_id: int, account_id: int) -> None:
+        """Delete a transaction by id for a given account."""
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM transactions WHERE id=%s AND acc_id=%s", (txn_id, account_id))
+
     def move_txn_up(self, account_id: int, txn_id: int) -> None:
         """
         Swap c_id with the nearest previous row (by c_id) to move the txn up.
@@ -298,6 +303,95 @@ class Database:
                 cur.execute("UPDATE transactions SET c_id=%s WHERE id=%s", (next_idx, txn_id))
                 cur.execute("UPDATE transactions SET c_id=%s WHERE id=%s", (cur_idx, next_id))
 
+    def _rebalance_txn_order(self, account_id: int) -> None:
+        """Reassign c_id values for all transactions in an account with even spacing.
+
+        Highest (top-most) gets the largest c_id. Spacing of 10 is used.
+        """
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM transactions
+                WHERE acc_id=%s
+                ORDER BY c_id DESC, date DESC, id DESC
+                """,
+                (account_id,),
+            )
+            ids = [int(r[0]) for r in cur.fetchall()]
+
+            # Assign descending indices so top-most has highest c_id
+            base = 10 * len(ids)
+            for i, tid in enumerate(ids):
+                new_idx = base - i * 10
+                cur.execute("UPDATE transactions SET c_id=%s WHERE id=%s", (new_idx, tid))
+
+    def move_txn_before(self, account_id: int, src_txn_id: int, dst_txn_id: int) -> None:
+        """Place src transaction immediately before dst transaction in display order.
+
+        Display order is by c_id DESC, then date DESC, then id DESC. Placing "before"
+        means giving src a c_id between the previous neighbor of dst (if any) and dst.
+        Rebalances when necessary to create space.
+        """
+        if src_txn_id == dst_txn_id:
+            return
+
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            # Current indices
+            cur.execute(
+                "SELECT c_id FROM transactions WHERE id=%s AND acc_id=%s",
+                (dst_txn_id, account_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            dst_idx = int(row[0])
+
+            # Previous neighbor (above in list => larger c_id)
+            cur.execute(
+                """
+                SELECT c_id FROM transactions
+                WHERE acc_id=%s AND c_id > %s
+                ORDER BY c_id ASC, id ASC
+                LIMIT 1
+                """,
+                (account_id, dst_idx),
+            )
+            row = cur.fetchone()
+            prev_idx = int(row[0]) if row else None
+
+            def compute_new_idx(prev_i: Optional[int], dst_i: int) -> int:
+                if prev_i is None:
+                    # Insert at very top
+                    return dst_i + 10
+                # Average (guaranteed integer); may collide if too tight
+                return (prev_i + dst_i) // 2
+
+            new_idx = compute_new_idx(prev_idx, dst_idx)
+
+            # If no space, rebalance and recompute
+            if prev_idx is not None and (new_idx == prev_idx or new_idx == dst_idx):
+                self._rebalance_txn_order(account_id)
+                # Re-fetch dst & prev after rebalance
+                cur.execute(
+                    "SELECT c_id FROM transactions WHERE id=%s AND acc_id=%s",
+                    (dst_txn_id, account_id),
+                )
+                dst_idx = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    SELECT c_id FROM transactions
+                    WHERE acc_id=%s AND c_id > %s
+                    ORDER BY c_id ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (account_id, dst_idx),
+                )
+                row = cur.fetchone()
+                prev_idx = int(row[0]) if row else None
+                new_idx = compute_new_idx(prev_idx, dst_idx)
+
+            cur.execute("UPDATE transactions SET c_id=%s WHERE id=%s", (new_idx, src_txn_id))
+
     # ========= PAY SCHEDULE (pay_schedule) =========
 
     def upsert_pay_schedule(self, *, anchor_date: date) -> None:
@@ -311,11 +405,11 @@ class Database:
 
     def get_pay_window(self, today: date | None = None) -> tuple[date, date]:
         """
-        Return (window_start, window_end) for the 14-day pay window that CONTAINS
+        Return (window_start, window_end) for the bi-weekly pay window that CONTAINS
         "today" (inclusive), based on the known bi-weekly anchor payday.
 
-        - Includes the actual payday (window_start = payday)
-        - Always 14 days long: [start, start+13]
+        - Start is the payday (window_start = payday)
+        - End is the FOLLOWING payday (inclusive): [start, next_payday]
         - If payday slips, this still returns the prior window covering today.
         """
         today = today or date.today()
@@ -329,7 +423,8 @@ class Database:
         days = (today - anchor).days
         k = days // step  # floor division works for negatives too
         start = anchor + timedelta(days=step * k)
-        end = start + timedelta(days=13)
+        # End on the following payday (14 days after start), inclusive
+        end = start + timedelta(days=14)
         # If today somehow falls before the very first anchor (k<0), start is previous cycle
         return start, end
 
@@ -357,6 +452,50 @@ class Database:
             """, (payee, frequency.lower(), amount_due, total_debt or Decimal("0"),
                 account_id, due_day, due_month, due_dom, notes))
             return int(cur.fetchone()[0])
+
+    def update_bill(
+        self,
+        *,
+        bill_id: int,
+        payee: str,
+        amount_due: Decimal,
+        frequency: str,          # 'monthly' | 'yearly'
+        due_day: int | None,     # for monthly
+        due_month: int | None,   # for yearly (1..12)
+        due_dom: int | None,     # for yearly (1..31)
+        account_id: int | None,
+        total_debt: Decimal | None = None,
+        notes: str = "",
+    ) -> None:
+        """Update an existing bill's core fields."""
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bills
+                   SET payee=%s,
+                       frequency=%s,
+                       amount_due=%s,
+                       total_debt=%s,
+                       account_id=%s,
+                       due_day=%s,
+                       due_month=%s,
+                       due_dom=%s,
+                       notes=%s
+                 WHERE id=%s
+                """,
+                (
+                    payee,
+                    frequency.lower(),
+                    amount_due,
+                    (total_debt or Decimal("0")),
+                    account_id,
+                    due_day,
+                    due_month,
+                    due_dom,
+                    notes,
+                    bill_id,
+                ),
+            )
 
     def list_bills(self, *, active_only: bool = True) -> list[dict]:
         sql = """
@@ -472,6 +611,44 @@ class Database:
                 """,
                 (bill_id, due_date, bool(ignored)),
             )
+
+    # ---------------- Suggestions ----------------
+
+    def suggest_transaction_names(
+        self,
+        *,
+        account_id: Optional[int] = None,
+        prefix: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[str]:
+        """Return up to `limit` transaction names ordered by most recently used, filtered by optional prefix.
+
+        - If `account_id` is provided, limit suggestions to that account; otherwise include all accounts.
+        - Case-insensitive prefix match using ILIKE 'prefix%'.
+        - Orders by last used date desc, then frequency desc, then name asc for stability.
+        """
+        where = ["name IS NOT NULL", "name <> ''"]
+        params: List[object] = []
+        if account_id is not None:
+            where.append("acc_id = %s")
+            params.append(int(account_id))
+        if prefix:
+            where.append("name ILIKE %s")
+            params.append(prefix + "%")
+        where_sql = " AND ".join(where) if where else "TRUE"
+
+        sql = f"""
+            SELECT name, MAX(date) AS last_used, COUNT(*) AS freq
+            FROM transactions
+            WHERE {where_sql}
+            GROUP BY name
+            ORDER BY last_used DESC NULLS LAST, freq DESC, name ASC
+            LIMIT %s
+        """
+        params.append(int(limit))
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            return [str(r[0]) for r in cur.fetchall()]
 
 def _last_dom(y: int, m: int) -> int:
     if m in (1, 3, 5, 7, 8, 10, 12):
