@@ -5,15 +5,17 @@ from __future__ import annotations
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, Pango
+from gi.repository import Gtk, Adw, Pango, Gdk, GLib
 
 from decimal import Decimal
-from datetime import date as _date
+from datetime import date as _date, timedelta as _td
 
 from app.util import fmt_money, CURRENCY_SYMBOL
 from app.ui.dialogs import (
     AddAccountDialog,
     AddTransactionDialog,
+    EditBillDialog,
+    EditTransactionDialog,
     AddBillDialog,
     SetPayScheduleDialog,
 )
@@ -26,6 +28,10 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title="MyLedger")
         self.set_default_size(1100, 680)
         self.db = db
+        # Remember whether the user enabled Edit Order (sticky across refreshes)
+        self._edit_order_active = False
+        # Summary pay window offset (0 = current, +1 next, -1 previous)
+        self._summary_window_offset = 0
 
         # Header
         header = Adw.HeaderBar()
@@ -130,7 +136,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     # ---------- Summary (includes current pay-window bills) ----------
 
-    def show_summary(self):
+    def show_summary(self, *, window_offset: int | None = None):
         from app.util import fmt_money, CURRENCY_SYMBOL
 
         self.clear_box(self.main_area)
@@ -167,13 +173,43 @@ class MainWindow(Adw.ApplicationWindow):
         self.main_area.append(tot)
         self.main_area.append(cntl)
 
-        # Bills due this pay window
-        ws, we = self.db.get_pay_window()
+        # Determine pay window (with offset support for scrolling/navigating)
+        if window_offset is not None:
+            self._summary_window_offset = int(window_offset)
+        # Shift "today" to the desired window by 14-day steps
+        shifted_today = _date.today() + _td(days=14 * self._summary_window_offset)
+        ws, we = self.db.get_pay_window(today=shifted_today)
 
-        cycle_lbl = Gtk.Label(label=f"Bills due this pay window: {ws} → {we}")
+        # Navigation controls for pay windows
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        prev_btn = Gtk.Button.new_with_label("◀")
+        next_btn = Gtk.Button.new_with_label("▶")
+        cycle_lbl = Gtk.Label(label=f"Bills: {ws} → {we}")
         cycle_lbl.get_style_context().add_class("title-3")
         cycle_lbl.set_xalign(0)
-        self.main_area.append(cycle_lbl)
+        nav.append(prev_btn)
+        nav.append(cycle_lbl)
+        nav.append(next_btn)
+
+        def _go_prev(_b):
+            self.show_summary(window_offset=self._summary_window_offset - 1)
+        def _go_next(_b):
+            self.show_summary(window_offset=self._summary_window_offset + 1)
+        prev_btn.connect("clicked", _go_prev)
+        next_btn.connect("clicked", _go_next)
+
+        # Add horizontal scroll gesture to switch windows
+        scr = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.HORIZONTAL)
+        def _on_scroll(_ctrl, dx, dy):
+            # Right swipe/scroll (dx < 0) -> next; left (dx > 0) -> prev
+            if dx < 0:
+                _go_next(None)
+            elif dx > 0:
+                _go_prev(None)
+            return True
+        scr.connect("scroll", _on_scroll)
+        nav.add_controller(scr)
+        self.main_area.append(nav)
 
         rows = self.db.upcoming_bills(window_start=ws, window_end=we)
         # Exclude ignored bills from the Summary view entirely
@@ -266,14 +302,14 @@ class MainWindow(Adw.ApplicationWindow):
         def load():
             self.clear_box(list_box)
 
-            # Show bills for the CURRENT pay window only, so ignore/paid toggles
-            # operate on the same occurrence shown in Summary.
-            ws, we = self.db.get_pay_window()
-            rows = self.db.upcoming_bills(window_start=ws, window_end=we)
+            # Show ALL active bills, each with its computed next due date.
+            rows = self.db.list_bills(active_only=True)
 
             if not rows:
-                list_box.append(Gtk.Label(label="No bills in this pay window.", xalign=0))
+                list_box.append(Gtk.Label(label="No active bills.", xalign=0))
                 return
+
+            today = _date.today()
 
             for b in rows:
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -284,7 +320,19 @@ class MainWindow(Adw.ApplicationWindow):
                 right.set_halign(Gtk.Align.END)
                 right.set_hexpand(True)
 
-                name = Gtk.Label(label=f"{b['payee']} — next due {b['next_due']}", xalign=0)
+                # Compute next due date for display and actions
+                dd = None
+                try:
+                    freq = (b.get('frequency') or 'monthly').lower()
+                    if freq == 'monthly' and b.get('due_day'):
+                        dd = _next_monthly_due(int(b.get('due_day')), today)
+                    elif freq == 'yearly' and b.get('due_month') and b.get('due_dom'):
+                        dd = _next_yearly_due(int(b.get('due_month')), int(b.get('due_dom')), today)
+                except Exception:
+                    dd = None
+
+                name_txt = f"{b['payee']} — next due {dd}" if dd else f"{b['payee']}"
+                name = Gtk.Label(label=name_txt, xalign=0)
                 sub = Gtk.Label(label=(b.get("account_name") or ""), xalign=0)
                 sub.get_style_context().add_class("dim-label")
                 left.append(name)
@@ -293,30 +341,50 @@ class MainWindow(Adw.ApplicationWindow):
                 amt = Gtk.Label(label=fmt_money(Decimal(str(b["amount_due"])), CURRENCY_SYMBOL))
                 right.append(amt)
 
-                # Ignore toggle (per-occurrence)
-                ignore = Gtk.CheckButton(label="Ignore")
-                ignore.set_active(bool(b.get("ignored", False)))
-                ignore.set_sensitive(not b.get("paid", False))
+                # Ignore/paid actions are tied to a specific occurrence (next due)
+                # Only show when we can compute a due date.
+                if dd is not None:
+                    paid = self.db._is_bill_paid(bill_id=int(b["id"]), due_date=dd)
+                    ignored = self.db._is_bill_ignored(bill_id=int(b["id"]), due_date=dd)
 
-                def on_ignore_toggled(w, bid=b["id"], dd=b["next_due"]):
-                    self.db.set_bill_ignored(bill_id=bid, due_date=dd, ignored=w.get_active())
-                    reload_view()
+                    # Ignore toggle (per-occurrence)
+                    ignore = Gtk.CheckButton(label="Ignore")
+                    ignore.set_active(bool(ignored))
+                    ignore.set_sensitive(not paid)
 
-                ignore.connect("toggled", on_ignore_toggled)
-                right.append(ignore)
+                    def on_ignore_toggled(w, bid=b["id"], due_d=dd):
+                        self.db.set_bill_ignored(bill_id=bid, due_date=due_d, ignored=w.get_active())
+                        reload_view()
 
-                # Mark paid
-                pay = Gtk.Button.new_with_label("Mark paid")
-                pay.set_sensitive(not b.get("paid", False))
-                pay.connect(
-                    "clicked",
-                    lambda _w, bid=b["id"], dd=b["next_due"]: (
-                        self.db.mark_bill_paid(bill_id=bid, due_date=dd),
-                        self.reload_sidebar(),
-                        reload_view(),
-                    ),
-                )
-                right.append(pay)
+                    ignore.connect("toggled", on_ignore_toggled)
+                    right.append(ignore)
+
+                    # Mark paid
+                    pay = Gtk.Button.new_with_label("Mark paid")
+                    pay.set_sensitive(not paid)
+                    pay.connect(
+                        "clicked",
+                        lambda _w, bid=b["id"], due_d=dd: (
+                            self.db.mark_bill_paid(bill_id=bid, due_date=due_d),
+                            self.reload_sidebar(),
+                            reload_view(),
+                        ),
+                    )
+                    right.append(pay)
+
+                # Double-click to edit bill details
+                def _on_pressed(gesture, n_press, x, y, _bill=b):
+                    if n_press == 2:
+                        EditBillDialog(
+                            self,
+                            self.db,
+                            _bill,
+                            on_saved=reload_view,
+                        ).show()
+                click = Gtk.GestureClick()
+                click.set_button(0)
+                click.connect("pressed", _on_pressed)
+                row.add_controller(click)
 
                 row.append(left)
                 row.append(right)
@@ -359,6 +427,11 @@ class MainWindow(Adw.ApplicationWindow):
         edit_toggle = Gtk.CheckButton(label="Edit order")
         toolbar.append(add_txn_btn)
         toolbar.append(edit_toggle)
+        # Initialize from sticky state and keep it updated
+        edit_toggle.set_active(self._edit_order_active)
+        def _persist_toggle_state(w):
+            self._edit_order_active = bool(w.get_active())
+        edit_toggle.connect("toggled", _persist_toggle_state)
 
         txn_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         txn_list.set_hexpand(True)
@@ -372,9 +445,43 @@ class MainWindow(Adw.ApplicationWindow):
 
         def load_txns():
             self.clear_box(txn_list)
+            # Start running balance from current Available balance
+            run_bal = Decimal(avail)
             for r in self.db.list_transactions(account_id):
                 rowbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 rowbox.set_hexpand(True)
+                # Attach drag source and drop target for drag-to-reorder
+                tid = int(r.get("id"))
+
+                def _drag_prepare(_src, _x, _y, _tid=tid):
+                    # Provide the transaction id as a string payload
+                    return Gdk.ContentProvider.new_for_value(str(_tid))
+
+                src = Gtk.DragSource()
+                src.set_actions(Gdk.DragAction.MOVE)
+                src.connect("prepare", _drag_prepare)
+                rowbox.add_controller(src)
+
+                def _on_drop(_target, value, _x, _y, _drop_tid=tid, _aid=account_id):
+                    # Only allow reordering when Edit order is active
+                    # value is the source transaction id as a string
+                    try:
+                        src_tid = int(value)
+                    except Exception:
+                        return False
+                    if not edit_toggle.get_active():
+                        return False
+                    if src_tid == _drop_tid:
+                        return False
+                    # Move src before the drop target
+                    self.db.move_txn_before(_aid, src_tid, _drop_tid)
+                    self.reload_sidebar()
+                    self.show_account(_aid)
+                    return True
+
+                tgt = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
+                tgt.connect("drop", _on_drop)
+                rowbox.add_controller(tgt)
 
                 left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
                 right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -397,17 +504,24 @@ class MainWindow(Adw.ApplicationWindow):
                 left.append(sub)
 
                 amount = Decimal(r.get("amount") or 0)
+                # Amount label
                 amt = Gtk.Label(label=fmt_money(amount, CURRENCY_SYMBOL))
                 amt.set_xalign(1.0)
                 if amount < 0:
                     amt.get_style_context().add_class("error")
                 else:
                     amt.get_style_context().add_class("success")
-                right.append(amt)
+                # Running balance label (balance after this transaction)
+                rb = Gtk.Label(label=f"{fmt_money(run_bal, CURRENCY_SYMBOL)}")
+                rb.get_style_context().add_class("dim-label")
+                rb.set_xalign(1.0)
+                amt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+                amt_box.append(amt)
+                amt_box.append(rb)
+                right.append(amt_box)
 
                 pend = Gtk.CheckButton(label="Pending")
                 pend.set_active(bool(int(r.get("pending") or 0)))
-                tid = int(r.get("id"))
 
                 def on_pend_toggled(w):
                     self.db.set_txn_pending(tid, w.get_active())
@@ -442,14 +556,34 @@ class MainWindow(Adw.ApplicationWindow):
                     d.set_visible(vis)
 
                 edit_toggle.connect("toggled", _toggle)
+                # Respect sticky state for initial visibility
                 up.set_visible(edit_toggle.get_active())
                 down.set_visible(edit_toggle.get_active())
                 right.append(up)
                 right.append(down)
 
+                # Double-click to edit
+                def _on_pressed(gesture, n_press, x, y, _txn=r):
+                    if n_press == 2:
+                        EditTransactionDialog(
+                            self,
+                            self.db,
+                            account_id,
+                            _txn,
+                            on_saved=lambda: (self.reload_sidebar(), self.show_account(account_id)),
+                        ).show()
+
+                click = Gtk.GestureClick()
+                click.set_button(0)  # any button; 0 means any
+                click.connect("pressed", _on_pressed)
+                rowbox.add_controller(click)
+
                 rowbox.append(left)
                 rowbox.append(right)
                 txn_list.append(rowbox)
+
+                # Move to next older transaction: remove current amount effect
+                run_bal -= amount
 
         add_txn_btn.connect(
             "clicked",
