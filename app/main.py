@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 import os
-from dotenv import load_dotenv
 import gi
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv() -> None:
+        return
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -14,13 +18,11 @@ from app.ui.main_window import MainWindow
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise SystemExit("DATABASE_URL not set. Add it to .env")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "db/myledger.sqlite3")
 
 def main():
     app = Adw.Application(application_id="com.example.myledger.py")
-    db = Database(DATABASE_URL)
+    db = Database(DATABASE_PATH)
     def on_activate(app: Adw.Application):
         win = MainWindow(app, db); win.present()
     app.connect("activate", on_activate)

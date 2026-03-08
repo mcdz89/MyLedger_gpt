@@ -4,13 +4,91 @@ from __future__ import annotations
 from decimal import Decimal
 from datetime import date, timedelta
 from typing import Optional, List, Dict, Tuple
-from psycopg_pool import ConnectionPool
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+import sqlite3
+
+
+sqlite3.register_adapter(Decimal, lambda d: str(d))
+sqlite3.register_adapter(date, lambda d: d.isoformat())
+sqlite3.register_converter("NUMERIC", lambda b: Decimal(b.decode()))
+sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
+
+
+class _SQLiteCursor:
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self._cursor = cursor
+
+    def execute(self, sql: str, params: tuple | list = ()) -> "_SQLiteCursor":
+        sql = sql.replace("%s", "?").replace(" ILIKE ", " LIKE ").replace(" NULLS LAST", "")
+        sql = sql.replace("NOW()", "CURRENT_TIMESTAMP")
+        self._cursor.execute(sql, params)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def description(self):
+        if self._cursor.description is None:
+            return None
+        return [SimpleNamespace(name=c[0]) for c in self._cursor.description]
+
+    def __enter__(self) -> "_SQLiteCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._cursor.close()
+        return False
+
+
+class _SQLiteConnCtx:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def cursor(self) -> _SQLiteCursor:
+        return _SQLiteCursor(self._conn.cursor())
+
+
+class _SQLitePool:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    @contextmanager
+    def connection(self):
+        ctx = _SQLiteConnCtx(self._conn)
+        try:
+            yield ctx
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
 
 class Database:
-    def __init__(self, dsn: str) -> None:
-        # autocommit so each statement is its own transaction
-        self.pool = ConnectionPool(conninfo=dsn, min_size=1, max_size=5, kwargs={"autocommit": True})
+    def __init__(self, db_path: str) -> None:
+        path = Path(db_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._conn = sqlite3.connect(
+            path,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            check_same_thread=False,
+        )
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self.pool = _SQLitePool(self._conn)
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        schema_path = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
+        with schema_path.open("r", encoding="utf-8") as f:
+            self._conn.executescript(f.read())
+        self._conn.commit()
 
     # ---------------- Accounts ----------------
 
